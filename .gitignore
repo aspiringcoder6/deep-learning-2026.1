@@ -1,0 +1,24 @@
+# Local Python environment and build files
+/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Competition files and generated experiment artifacts
+/data/*
+!/data/README.md
+/outputs/
+asap-aes.zip
+training_set_rel3.*
+valid_set.*
+test_set.*
+*.pt
+*.pth
+*.pkl
+*.joblib
+.env
+kaggle.json
