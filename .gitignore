@@ -7,11 +7,17 @@ __pycache__/
 /dist/
 .pytest_cache/
 .ipynb_checkpoints/
+/.build/
 
 # Competition files and generated experiment artifacts
 /data/*
 !/data/README.md
-/outputs/
+!/data/analysis/
+!/data/splits/
+/outputs/*
+!/outputs/asap-aes/
+/outputs/asap-aes/*
+!/outputs/asap-aes/experiments.xlsx
 asap-aes.zip
 training_set_rel3.*
 valid_set.*

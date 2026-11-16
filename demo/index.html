@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Demo chấm bài luận · ASAP-AES</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f4f6fb; color: #18243b; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    .shell { max-width: 1040px; margin: 0 auto; padding: 36px 20px 60px; }
+    .eyebrow { color: #4d5ab0; font-size: .8rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { font-size: clamp(2rem, 5vw, 3.2rem); line-height: 1.1; margin: 10px 0 12px; }
+    .intro { color: #526078; max-width: 680px; line-height: 1.6; margin-bottom: 28px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, 1fr); gap: 20px; }
+    .card { background: #fff; border: 1px solid #dfe5f0; border-radius: 20px; padding: 26px; box-shadow: 0 12px 36px rgba(25, 42, 80, .06); }
+    .card h2 { margin: 0 0 22px; font-size: 1.15rem; }
+    label { display: block; font-weight: 700; margin: 18px 0 7px; }
+    select, textarea { display: block; width: 100%; color: inherit; font: inherit; background: #fbfcff; border: 1px solid #bfc9dc; border-radius: 11px; padding: 12px 14px; }
+    select:focus, textarea:focus, button:focus-visible { outline: 3px solid #aab9ff; outline-offset: 2px; }
+    textarea { resize: vertical; line-height: 1.5; }
+    #prompt { min-height: 90px; }
+    #essay { min-height: 240px; }
+    .hint { font-size: .86rem; color: #66748b; margin: 7px 0 0; }
+    button { border: 0; border-radius: 12px; background: #3549bd; color: #fff; padding: 13px 24px; margin-top: 22px; font: inherit; font-weight: 700; cursor: pointer; }
+    button:hover { background: #263897; }
+    .badge { display: inline-block; border-radius: 999px; padding: 7px 12px; color: #854b00; background: #fff0cf; font-size: .8rem; font-weight: 800; }
+    .empty { color: #68758b; line-height: 1.6; padding-top: 22px; }
+    .score { font-size: 3.2rem; font-weight: 800; line-height: 1; margin: 28px 0 8px; color: #263897; }
+    .range { color: #526078; font-size: 1.05rem; }
+    .notice { border-left: 4px solid #edb354; padding: 10px 13px; background: #fff9ec; color: #79552b; line-height: 1.5; margin-top: 26px; }
+    .error { color: #a72929; font-weight: 600; min-height: 1.3em; }
+    .contract { color: #526078; font-size: .9rem; line-height: 1.55; margin-top: 26px; }
+    code { background: #eef1f8; border-radius: 4px; padding: 2px 4px; }
+    @media (max-width: 740px) { .grid { grid-template-columns: 1fr; } .card { padding: 20px; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="eyebrow">ASAP-AES · Demo local</div>
+    <h1>Chấm điểm bài luận</h1>
+    <p class="intro">Nhập mã đề và dán bài luận để xem luồng giao diện. Kết quả hiện tại là điểm giả lập cố định theo thang điểm, chưa được tính từ nội dung bài.</p>
+    <div class="grid">
+      <form class="card" id="form">
+        <h2>Thông tin bài viết</h2>
+        <label for="essay-set">Mã đề</label>
+        <select id="essay-set" required>
+          <option value="1">Đề 1 · Thang 2–12</option>
+          <option value="2">Đề 2 · Thang 1–6</option>
+          <option value="3">Đề 3 · Thang 0–3</option>
+          <option value="4">Đề 4 · Thang 0–3</option>
+          <option value="5">Đề 5 · Thang 0–4</option>
+          <option value="6">Đề 6 · Thang 0–4</option>
+          <option value="7">Đề 7 · Thang 0–30</option>
+          <option value="8">Đề 8 · Thang 0–60</option>
+        </select>
+        <label for="prompt">Đề bài</label>
+        <textarea id="prompt" placeholder="Dán nội dung đề bài để hiển thị cùng bài luận" required></textarea>
+        <p class="hint">Nội dung đề bài chỉ phục vụ giao diện mẫu.</p>
+        <label for="essay">Bài luận</label>
+        <textarea id="essay" placeholder="Dán bài luận của bạn vào đây" required></textarea>
+        <p class="error" id="error" role="alert"></p>
+        <button type="submit">Chấm điểm</button>
+      </form>
+      <section class="card" aria-live="polite">
+        <h2>Kết quả</h2>
+        <span class="badge">ĐIỂM GIẢ LẬP</span>
+        <div id="result" class="empty">Điểm sẽ xuất hiện ở đây sau khi bạn nhập đề bài và bài luận.</div>
+        <div class="notice">Demo chưa dùng mô hình. Điểm hiển thị không phản ánh chất lượng bài viết.</div>
+        <p class="contract">Đầu vào mô hình dự kiến: <code>essay_set</code> và <code>essay</code>. Đầu ra: <code>predicted_score</code> và <code>score_range</code>.</p>
+      </section>
+    </div>
+  </main>
+  <script>
+    const bounds = {1:[2,12], 2:[1,6], 3:[0,3], 4:[0,3], 5:[0,4], 6:[0,4], 7:[0,30], 8:[0,60]};
+    document.getElementById('form').addEventListener('submit', event => {
+      event.preventDefault();
+      const essaySet = Number(document.getElementById('essay-set').value);
+      const prompt = document.getElementById('prompt').value.trim();
+      const essay = document.getElementById('essay').value.trim();
+      const error = document.getElementById('error');
+      if (!prompt || !essay) { error.textContent = 'Vui lòng nhập đề bài và bài luận.'; return; }
+      error.textContent = '';
+      const [min, max] = bounds[essaySet];
+      const mockScore = Math.floor((min + max) / 2);
+      document.getElementById('result').innerHTML = `<div class="score">${mockScore}</div><div class="range">Đề ${essaySet} · Thang điểm ${min}–${max}</div><p class="hint">Giá trị giả lập cố định, không dựa trên bài luận.</p>`;
+    });
+  </script>
+</body>
+</html>

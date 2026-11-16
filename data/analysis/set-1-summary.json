@@ -1,0 +1,37 @@
+{
+  "essay_set": 1,
+  "dataset_sha256": "cf04127eaff3224ce4aab64654e62e5738d3d672c61bb998546dd1674c60d312",
+  "source_rows": 1783,
+  "clean_rows": 1783,
+  "statistics_scope": "train only; test labels excluded",
+  "score_range": {
+    "min": 2,
+    "max": 12
+  },
+  "observed_scores": {
+    "2": 8,
+    "3": 1,
+    "4": 12,
+    "5": 10,
+    "6": 92,
+    "7": 115,
+    "8": 537,
+    "9": 273,
+    "10": 261,
+    "11": 86,
+    "12": 32
+  },
+  "word_count": {
+    "min": 8,
+    "median": 367,
+    "mean": 366.71,
+    "p90": 521,
+    "max": 785
+  },
+  "split_counts": {
+    "train": 1427,
+    "validation": 178,
+    "test": 178
+  },
+  "duplicate_text_across_splits": 0
+}

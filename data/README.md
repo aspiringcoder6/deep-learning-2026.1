@@ -1,7 +1,5 @@
-# ASAP-AES data
+# Dữ liệu ASAP-AES
 
-Download `training_set_rel3.tsv` from the competition's Data tab and save it as `data/raw/training_set_rel3.tsv`. Kaggle may require signing in and accepting the competition rules. [ASAP-AES on Kaggle](https://www.kaggle.com/competitions/asap-aes/data)
+Đặt file có nhãn `training_set_rel3.tsv` tại `data/raw/`. Nguồn gốc: [Kaggle ASAP-AES](https://www.kaggle.com/competitions/asap-aes/data). Bản sao dùng ở đây: [TasfiaS/ASAP-AES](https://huggingface.co/datasets/TasfiaS/ASAP-AES/blob/main/training_set_rel3.tsv), SHA-256 `cf04127eaff3224ce4aab64654e62e5738d3d672c61bb998546dd1674c60d312`.
 
-The loader uses `essay_id`, `essay_set`, `essay`, and `domain1_score`. Each run selects one essay set and uses its Domain 1 score as the regression target. The labeled training file supplies the local train, validation, and test splits.
-
-Keep the competition files in `data/raw/`. Git ignores downloaded data and generated outputs.
+File TSV cần `essay_id`, `essay_set`, `essay` và nhãn `domain1_score`. `data/raw/` không được commit. Chạy `python -m essay_scoring prepare --essay-set 1 --seed 42` để xác minh và tái tạo manifest cùng thống kê. Manifest `data/splits/set-1-v1.json` và báo cáo `data/analysis/set-1-summary.json` được lưu trong repo để các thành viên dùng cùng tập chia. Dùng đúng file có checksum trên khi chạy train/evaluate.
