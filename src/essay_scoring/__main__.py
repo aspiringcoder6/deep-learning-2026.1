@@ -6,6 +6,11 @@ import hashlib
 import json
 import pickle
 import statistics
+import math
+import platform
+import time
+from datetime import datetime, timezone
+from importlib.metadata import version
 from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +21,7 @@ from essay_scoring.data import (
     SPLIT_VERSION,
     create_manifest,
     load_asap,
+    load_training_split,
     manifest_path,
     read_manifest,
 )
@@ -70,9 +76,8 @@ def train(args: argparse.Namespace) -> None:
     if args.run_dir.exists():
         raise ValueError(f"Choose a new run directory. {args.run_dir} already exists.")
 
-    essays, fingerprint = load_asap(args.data, args.essay_set)
     manifest_file = _manifest_file(args, args.essay_set)
-    split = read_manifest(manifest_file, essays, fingerprint, args.essay_set)
+    split, fingerprint = load_training_split(args.data, manifest_file, args.essay_set)
     manifest_bytes = manifest_file.read_bytes()
     manifest = json.loads(manifest_bytes)
     if args.seed != manifest["seed"]:
@@ -80,17 +85,29 @@ def train(args: argparse.Namespace) -> None:
     bounds = SCORE_RANGES[args.essay_set]
     validation = split["validation"]
     settings = {}
+    started_at = datetime.now(timezone.utc).isoformat()
+    start = time.perf_counter()
     if args.model == "ridge":
         from essay_scoring.models.ridge import fit_ridge
 
         model = fit_ridge(split["train"])
+        training_seconds = time.perf_counter() - start
         predicted = model.predict([essay.text for essay in validation]).tolist()
         metrics = evaluate_scores([essay.score for essay in validation], predicted, bounds)
+        settings = {"ngram_range": [1, 2], "max_features": 30_000,
+                    "feature_count": len(model.named_steps["tfidfvectorizer"].vocabulary_),
+                    "ridge_parameters": model.named_steps["ridge"].get_params()}
     else:
         from essay_scoring.models.han import fit_han
 
         settings = {"epochs": args.epochs, "batch_size": args.batch_size}
         model, metrics = fit_han(split["train"], validation, bounds, seed=args.seed, **settings)
+        training_seconds = time.perf_counter() - start
+        settings = {**settings, **model["training"], **model["model_config"],
+                    "max_sentences": model["max_sentences"], "max_words": model["max_words"]}
+        from essay_scoring.models.han import predict_checkpoint
+
+        predicted = predict_checkpoint(model, [essay.text for essay in validation], bounds)
 
     run = {
         "essay_set": args.essay_set,
@@ -100,8 +117,14 @@ def train(args: argparse.Namespace) -> None:
         "split_version": SPLIT_VERSION,
         "dataset_sha256": fingerprint,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "splits": {name: [essay.essay_id for essay in group] for name, group in split.items()},
+        "splits": manifest["splits"],
         "validation_metrics": metrics,
+        "started_at_utc": started_at,
+        "training_seconds": training_seconds,
+        "training_time_scope": "fit, including per-epoch validation for HAN; excludes serialization/reload",
+        "environment": {"python": platform.python_version(), "platform": platform.platform(),
+                        **{name: version(name) for name in ("numpy", "scikit-learn", "torch")}},
+        "test_content_and_labels_loaded": False,
     }
 
     args.run_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -114,10 +137,32 @@ def train(args: argparse.Namespace) -> None:
             import torch
 
             torch.save(model, staging / "model.pt")
+            with (staging / "training_history.csv").open("w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=("epoch", "train_loss", "validation_mse", "validation_qwk"))
+                writer.writeheader()
+                writer.writerows(model["training"]["history"])
+        reloaded = _predict(staging, run, [essay.text for essay in validation])
+        before = clip_scores(predicted, bounds)
+        after = clip_scores(reloaded, bounds)
+        max_delta = max(abs(a - b) for a, b in zip(before, after, strict=True))
+        reloaded_metrics = evaluate_scores([essay.score for essay in validation], after, bounds)
+        if max_delta > 1e-6 or any(
+            not math.isclose(metrics[key], reloaded_metrics[key], abs_tol=1e-6)
+            for key in metrics if metrics[key] is not None
+        ):
+            raise ValueError("Checkpoint reload changed validation predictions or metrics.")
+        run["checkpoint_verification"] = {
+            "validation_samples": len(after), "finite_and_in_range": True,
+            "max_absolute_reload_difference": max_delta, "reloaded_validation_metrics": reloaded_metrics,
+            "examples": [{"essay_id": essay.essay_id, "before": a, "after": b}
+                         for essay, a, b in list(zip(validation, before, after, strict=True))[:5]],
+            "checkpoint_sha256": hashlib.sha256(_model_file(staging, run).read_bytes()).hexdigest(),
+        }
         (staging / "run.json").write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
         staging.rename(args.run_dir)
 
-    print(json.dumps({"run_dir": str(args.run_dir), "validation_metrics": metrics}, indent=2))
+    print(json.dumps({"run_dir": str(args.run_dir), "validation_metrics": metrics,
+                      "training_seconds": training_seconds, "reload_max_difference": max_delta}, indent=2))
 
 
 def _read_run(run_dir: Path) -> dict:

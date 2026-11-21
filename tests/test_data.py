@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from essay_scoring.data import create_manifest, load_asap_with_audit, read_manifest
+from essay_scoring.data import create_manifest, load_asap_with_audit, load_training_split, read_manifest
 
 
 class AsapDataTest(unittest.TestCase):
@@ -32,11 +32,23 @@ class AsapDataTest(unittest.TestCase):
             split = read_manifest(manifest_file, essays, fingerprint, 1)
             self.assertEqual(sum(map(len, split.values())), 5)
             self.assertEqual(len({essay.essay_id for group in split.values() for essay in group}), 5)
+            training, same_fingerprint = load_training_split(path, manifest_file, 1)
+            self.assertEqual(set(training), {"train", "validation"})
+            self.assertEqual(same_fingerprint, fingerprint)
+            self.assertEqual(training["train"], split["train"])
 
             manifest["splits"]["test"][0] = manifest["splits"]["train"][0]
             manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "overlapping"):
                 read_manifest(manifest_file, essays, fingerprint, 1)
+
+    def test_scoped_loader_skips_test_label_and_text_before_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tiny.tsv"
+            path.write_text("essay_id\tessay_set\tessay\tdomain1_score\n"
+                            "1\t1\tTrain essay\t8\n2\t1\t\tSEALED\n", encoding="utf-8")
+            essays, _, _ = load_asap_with_audit(path, 1, allowed_ids={1})
+            self.assertEqual([essay.essay_id for essay in essays], [1])
 
 
 if __name__ == "__main__":

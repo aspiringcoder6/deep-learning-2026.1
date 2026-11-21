@@ -36,7 +36,7 @@ def canonical_text(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-def load_asap_with_audit(path: Path, essay_set: int) -> tuple[list[Essay], str, dict]:
+def load_asap_with_audit(path: Path, essay_set: int, *, allowed_ids: set[int] | None = None) -> tuple[list[Essay], str, dict]:
     if essay_set not in SCORE_RANGES:
         raise ValueError(f"Unknown essay set: {essay_set}.")
     raw = path.read_bytes()
@@ -60,6 +60,8 @@ def load_asap_with_audit(path: Path, essay_set: int) -> tuple[list[Essay], str, 
                 continue
             source_rows += 1
             essay_id = int(row["essay_id"])
+            if allowed_ids is not None and essay_id not in allowed_ids:
+                continue
             score = int(row["domain1_score"])
         except (TypeError, ValueError) as error:
             raise ValueError(f"Invalid ASAP record on line {rows.line_num} of {path}.") from error
@@ -103,6 +105,34 @@ def load_asap(path: Path, essay_set: int) -> tuple[list[Essay], str]:
 
 def manifest_path(essay_set: int) -> Path:
     return DEFAULT_SPLIT_DIR / f"set-{essay_set}-v{SPLIT_VERSION}.json"
+
+
+def load_training_split(path: Path, manifest_file: Path, essay_set: int):
+    """Validate the frozen IDs; only materialize train/validation text and labels."""
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    if manifest.get("essay_set") != essay_set or manifest.get("version") != SPLIT_VERSION:
+        raise ValueError("Manifest belongs to another essay set or split version.")
+    seed = manifest.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("Split manifest must have an integer seed.")
+    ids = manifest.get("splits", {})
+    if set(ids) != {"train", "validation", "test"} or any(not group for group in ids.values()):
+        raise ValueError("Manifest must contain nonempty train, validation, and test splits.")
+    all_ids = [i for name in ("train", "validation", "test") for i in ids[name]]
+    if any(type(i) is not int for i in all_ids) or len(set(all_ids)) != len(all_ids):
+        raise ValueError("Manifest has invalid or overlapping essay IDs.")
+    # Check recorded ordering using IDs alone, without opening test essays.
+    expected = split_essays([Essay(i, "", 0) for i in sorted(all_ids)], seed)
+    if any(ids[name] != [essay.essay_id for essay in expected[name]] for name in ids):
+        raise ValueError("Split IDs do not match the recorded seed and split version.")
+    allowed = set(ids["train"] + ids["validation"])
+    essays, fingerprint, _ = load_asap_with_audit(path, essay_set, allowed_ids=allowed)
+    if fingerprint != manifest.get("dataset_sha256"):
+        raise ValueError("Split manifest does not match the dataset SHA-256.")
+    by_id = {essay.essay_id: essay for essay in essays}
+    if set(by_id) != allowed:
+        raise ValueError("Training/validation IDs are missing, blank, or duplicated in the dataset.")
+    return {name: [by_id[i] for i in ids[name]] for name in ("train", "validation")}, fingerprint
 
 
 def create_manifest(path: Path, essay_set: int, seed: int) -> tuple[dict, list[Essay]]:
