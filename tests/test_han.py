@@ -44,6 +44,11 @@ class HANTrainingTest(unittest.TestCase):
             self.assertEqual(before, predict_han(path, texts, (2, 12)))
             with self.assertRaisesRegex(ValueError, "bounds"):
                 predict_han(path, texts, (0, 4))
+            legacy = dict(checkpoint)
+            for key in ("training", "model_config", "score_bounds"):
+                legacy.pop(key)
+            torch.save(legacy, path)
+            self.assertEqual(before, predict_han(path, texts, (2, 12)))
 
 
 if __name__ == "__main__":

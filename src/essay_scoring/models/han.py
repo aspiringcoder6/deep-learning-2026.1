@@ -235,7 +235,8 @@ def predict_checkpoint(checkpoint: dict, texts: list[str], bounds) -> list[float
     vocabulary = checkpoint["vocabulary"]
     model = HANRegressor(len(vocabulary) + 2, **checkpoint.get("model_config", {})).to(device)
     model.load_state_dict(checkpoint["weights"])
+    batch_size = checkpoint.get("training", {}).get("batch_size", 16)
     loader = _prediction_loader(
-        texts, vocabulary, checkpoint["max_sentences"], checkpoint["max_words"], batch_size=16
+        texts, vocabulary, checkpoint["max_sentences"], checkpoint["max_words"], batch_size=batch_size
     )
     return _predict(model, loader, device, bounds)

@@ -2,7 +2,6 @@
 
 import argparse
 import csv
-import hashlib
 import json
 import time
 from collections import Counter
@@ -11,6 +10,7 @@ from pathlib import Path
 import torch
 from torch.nn import functional as F
 
+from essay_scoring.artifacts import text_sha256
 from essay_scoring.data import DEFAULT_DATA_PATH, load_training_split, manifest_path
 from essay_scoring.models.han import (
     MAX_SENTENCES, MAX_WORDS, HANRegressor, _encode, _pad_batch, _sentences,
@@ -86,7 +86,7 @@ def main():
     report = {
         "status": "PASS" if passed else "FAIL", "seed": 42, "device": str(device),
         "dataset_sha256": fingerprint,
-        "manifest_sha256": hashlib.sha256(manifest_path(1).read_bytes()).hexdigest(),
+        "manifest_sha256": text_sha256(manifest_path(1)),
         "essay_ids": [essay.essay_id for essay in essays], "scope": "first train IDs in frozen manifest",
         "samples": len(essays), "steps": step, "learning_rate": 1e-3, "optimizer": "AdamW",
         "input_shape": list(tokens.shape), "output_shape": list(predicted.shape),
@@ -99,9 +99,13 @@ def main():
         "test_content_and_labels_loaded": False,
     }
     args.run_dir.mkdir(parents=True)
-    (args.run_dir / "smoke.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    (args.run_dir / "smoke.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
     with (args.run_dir / "training_history.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=("step", "train_loss", "eval_train_loss"))
+        writer = csv.DictWriter(
+            file, fieldnames=("step", "train_loss", "eval_train_loss"), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(history)
     print(json.dumps(report, indent=2), flush=True)

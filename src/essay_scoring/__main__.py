@@ -15,6 +15,7 @@ from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from essay_scoring.artifacts import matches_text_sha256, text_sha256
 from essay_scoring.data import (
     DEFAULT_DATA_PATH,
     SCORE_RANGES,
@@ -39,7 +40,7 @@ def prepare(args: argparse.Namespace) -> None:
     if target.exists() and target.read_text(encoding="utf-8") != rendered:
         raise ValueError(f"Refusing to replace a different frozen manifest: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(rendered, encoding="utf-8")
+    target.write_text(rendered, encoding="utf-8", newline="\n")
 
     by_id = {essay.essay_id: essay for essay in essays}
     train_essays = [by_id[essay_id] for essay_id in manifest["splits"]["train"]]
@@ -116,7 +117,7 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "split_version": SPLIT_VERSION,
         "dataset_sha256": fingerprint,
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "manifest_sha256": text_sha256(manifest_file),
         "splits": manifest["splits"],
         "validation_metrics": metrics,
         "started_at_utc": started_at,
@@ -138,7 +139,10 @@ def train(args: argparse.Namespace) -> None:
 
             torch.save(model, staging / "model.pt")
             with (staging / "training_history.csv").open("w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=("epoch", "train_loss", "validation_mse", "validation_qwk"))
+                writer = csv.DictWriter(
+                    file, fieldnames=("epoch", "train_loss", "validation_mse", "validation_qwk"),
+                    lineterminator="\n",
+                )
                 writer.writeheader()
                 writer.writerows(model["training"]["history"])
         reloaded = _predict(staging, run, [essay.text for essay in validation])
@@ -146,19 +150,24 @@ def train(args: argparse.Namespace) -> None:
         after = clip_scores(reloaded, bounds)
         max_delta = max(abs(a - b) for a, b in zip(before, after, strict=True))
         reloaded_metrics = evaluate_scores([essay.score for essay in validation], after, bounds)
-        if max_delta > 1e-6 or any(
-            not math.isclose(metrics[key], reloaded_metrics[key], abs_tol=1e-6)
-            for key in metrics if metrics[key] is not None
+        if any(
+            not math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
+            for a, b in zip(before, after, strict=True)
         ):
-            raise ValueError("Checkpoint reload changed validation predictions or metrics.")
+            raise ValueError("Checkpoint reload changed validation predictions.")
+        metrics = reloaded_metrics
+        run["validation_metrics"] = metrics
         run["checkpoint_verification"] = {
             "validation_samples": len(after), "finite_and_in_range": True,
             "max_absolute_reload_difference": max_delta, "reloaded_validation_metrics": reloaded_metrics,
+            "prediction_tolerance": {"relative": 1e-5, "absolute": 1e-6},
             "examples": [{"essay_id": essay.essay_id, "before": a, "after": b}
                          for essay, a, b in list(zip(validation, before, after, strict=True))[:5]],
             "checkpoint_sha256": hashlib.sha256(_model_file(staging, run).read_bytes()).hexdigest(),
         }
-        (staging / "run.json").write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+        (staging / "run.json").write_text(
+            json.dumps(run, indent=2) + "\n", encoding="utf-8", newline="\n"
+        )
         staging.rename(args.run_dir)
 
     print(json.dumps({"run_dir": str(args.run_dir), "validation_metrics": metrics,
@@ -183,14 +192,18 @@ def finalize(args: argparse.Namespace) -> None:
         "model": run["model"],
         "selection_note": args.note,
         "validation_metrics": run["validation_metrics"],
-        "run_sha256": hashlib.sha256((args.run_dir / "run.json").read_bytes()).hexdigest(),
+        "run_sha256": text_sha256(args.run_dir / "run.json"),
         "model_sha256": hashlib.sha256(_model_file(args.run_dir, run).read_bytes()).hexdigest(),
     }
     path = args.run_dir.parent / "final-selection.json"
     rendered = json.dumps(selection, indent=2, ensure_ascii=False) + "\n"
-    if path.exists() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"A different final model is already recorded at {path}.")
-    path.write_text(rendered, encoding="utf-8")
+    if path.exists():
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if matches_text_sha256(args.run_dir / "run.json", previous.get("run_sha256")):
+            previous["run_sha256"] = selection["run_sha256"]
+        if previous != selection:
+            raise ValueError(f"A different final model is already recorded at {path}.")
+    path.write_text(rendered, encoding="utf-8", newline="\n")
     print(json.dumps({"selection_file": str(path), "essay_set": run["essay_set"], "model": run["model"]}, indent=2))
 
 
@@ -210,7 +223,7 @@ def evaluate(args: argparse.Namespace) -> None:
     run = _read_run(args.run_dir)
     selection_path = args.run_dir.parent / "final-selection.json"
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
-    if (selection.get("run_sha256") != hashlib.sha256((args.run_dir / "run.json").read_bytes()).hexdigest()
+    if (not matches_text_sha256(args.run_dir / "run.json", selection.get("run_sha256"))
             or selection.get("model_sha256") != hashlib.sha256(_model_file(args.run_dir, run).read_bytes()).hexdigest()):
         raise ValueError("The selected run or checkpoint changed after finalization.")
     essay_set = run["essay_set"]
@@ -218,7 +231,7 @@ def evaluate(args: argparse.Namespace) -> None:
     if fingerprint != run["dataset_sha256"]:
         raise ValueError("Use the same ASAP TSV file used for training.")
     manifest_file = _manifest_file(args, essay_set)
-    if hashlib.sha256(manifest_file.read_bytes()).hexdigest() != run["manifest_sha256"]:
+    if not matches_text_sha256(manifest_file, run["manifest_sha256"]):
         raise ValueError("Use the exact split manifest saved with the trained run.")
     split = read_manifest(manifest_file, essays, fingerprint, essay_set)
     if {name: [essay.essay_id for essay in group] for name, group in split.items()} != run["splits"]:

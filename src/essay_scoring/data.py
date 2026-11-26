@@ -54,12 +54,14 @@ def load_asap_with_audit(path: Path, essay_set: int, *, allowed_ids: set[int] | 
     low, high = SCORE_RANGES[essay_set]
     essays = {}
     source_rows = 0
+    source_ids = []
     for row in rows:
         try:
             if int(row["essay_set"]) != essay_set:
                 continue
             source_rows += 1
             essay_id = int(row["essay_id"])
+            source_ids.append(essay_id)
             if allowed_ids is not None and essay_id not in allowed_ids:
                 continue
             score = int(row["domain1_score"])
@@ -95,6 +97,8 @@ def load_asap_with_audit(path: Path, essay_set: int, *, allowed_ids: set[int] | 
         "duplicate_text_essay_ids": duplicate_ids,
         "conflicting_score_essay_ids": conflicting_score_ids,
     }
+    if allowed_ids is not None:
+        audit["source_essay_ids"] = source_ids
     return list(unique_texts.values()), hashlib.sha256(raw).hexdigest(), audit
 
 
@@ -126,9 +130,23 @@ def load_training_split(path: Path, manifest_file: Path, essay_set: int):
     if any(ids[name] != [essay.essay_id for essay in expected[name]] for name in ids):
         raise ValueError("Split IDs do not match the recorded seed and split version.")
     allowed = set(ids["train"] + ids["validation"])
-    essays, fingerprint, _ = load_asap_with_audit(path, essay_set, allowed_ids=allowed)
+    essays, fingerprint, source_audit = load_asap_with_audit(path, essay_set, allowed_ids=allowed)
     if fingerprint != manifest.get("dataset_sha256"):
         raise ValueError("Split manifest does not match the dataset SHA-256.")
+    # Check coverage from IDs and the frozen cleaning audit without parsing test labels.
+    audit = manifest.get("audit", {})
+    excluded_ids = audit.get("blank_essay_ids", []) + audit.get("duplicate_text_essay_ids", [])
+    source_ids = source_audit["source_essay_ids"]
+    if (
+        any(type(i) is not int for i in excluded_ids)
+        or len(set(excluded_ids)) != len(excluded_ids)
+        or set(excluded_ids) & set(all_ids)
+        or len(set(source_ids)) != len(source_ids)
+        or (set(all_ids) | set(excluded_ids)) != set(source_ids)
+        or audit.get("source_rows") != len(source_ids)
+        or audit.get("kept_rows") != len(all_ids)
+    ):
+        raise ValueError("Manifest has missing or unknown essay IDs, or an invalid cleaning audit.")
     by_id = {essay.essay_id: essay for essay in essays}
     if set(by_id) != allowed:
         raise ValueError("Training/validation IDs are missing, blank, or duplicated in the dataset.")

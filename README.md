@@ -74,6 +74,31 @@ python -m essay_scoring evaluate --final-model --run-dir outputs/set-1/ridge
 
 Run ghi checksum dữ liệu, checksum manifest, seed, ID chia tập và metric validation trong `run.json`. Mỗi run cần thư mục mới. Chỉ mở checkpoint đáng tin cậy: Ridge dùng Python pickle.
 
+## Checkpoint đề 1
+
+Hai run `ridge-v2` và `han-v2` được train lại vì bản bàn giao v1 thiếu checkpoint. Các run v2 dùng manifest đề 1 đã chốt, seed 42, với 1.427 bài train và 178 bài validation. HAN train 5 epoch và chọn epoch 3 theo MSE validation. Gói phát hành có cả hai model, `run.json`, log HAN, manifest, checksum từng file và phiên bản thư viện đã dùng. [Bản phát hành ASAP set 1 v2](https://github.com/aspiringcoder6/deep-learning-2026.1/releases/tag/asap-set1-v2)
+
+| Run | QWK validation | MSE validation |
+| --- | ---: | ---: |
+| `ridge-v2` | 0.722835 | 0.952226 |
+| `han-v2` | 0.715822 | 0.987638 |
+
+Tải và mở gói trong PowerShell tại thư mục repo. Môi trường đã kiểm tra là Windows, Python 3.12 và PyTorch CPU. Bước kiểm tra SHA-256 xác nhận gói tải về đúng bản phát hành.
+
+```powershell
+$modelsZip = Join-Path $env:TEMP 'asap-set1-v2.zip'
+curl.exe --fail --location 'https://github.com/aspiringcoder6/deep-learning-2026.1/releases/download/asap-set1-v2/asap-set1-v2.zip' --output $modelsZip
+if ($LASTEXITCODE -ne 0) { throw 'Download failed.' }
+$expectedHash = '8858723b2400e91728dd289deeadcc57305e2aff1e3fa80cbc41838b936a963c'
+if ((Get-FileHash -LiteralPath $modelsZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash) { throw 'Archive checksum mismatch.' }
+Expand-Archive -LiteralPath $modelsZip -DestinationPath outputs/set-1 -Force
+python -m pip install -r outputs/set-1/requirements-cpu.txt
+python -m essay_scoring predict --essay-set 1 --run-dir outputs/set-1/ridge-v2 --essay-file path/to/essay.txt
+python -m essay_scoring predict --essay-set 1 --run-dir outputs/set-1/han-v2 --essay-file path/to/essay.txt
+```
+
+Metric validation của v2 được tính lại từ checkpoint đã nạp. Kiểm tra reload dùng batch size đã lưu và so sánh điểm liên tục với `rel_tol=1e-5`, `abs_tol=1e-6`. Checksum JSON tương thích với LF và CRLF, kể cả checksum cũ. TV3 dùng validation để chọn run trước khi gọi `finalize` và mở test.
+
 ## Demo local
 
 ```powershell
