@@ -1,8 +1,9 @@
 """Word and sentence attention with a regression head for essay scoring."""
 
 import re
+import math
+import random
 from collections import Counter
-from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -19,6 +20,30 @@ PAD_ID = 0
 UNKNOWN_ID = 1
 SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 WORD = re.compile(r"@\w+|[^\W_]+(?:['’][^\W_]+)*")
+
+
+def training_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def truncation_statistics(essays: list[Essay]) -> dict:
+    affected = lost = total = chunked = 0
+    for essay in essays:
+        full = _sentences(essay.text, max_sentences=10**9, max_words=MAX_WORDS)
+        lengths = [len(sentence) for sentence in full]
+        total += sum(lengths)
+        removed = sum(lengths[MAX_SENTENCES:])
+        lost += removed
+        affected += removed > 0
+        chunked += any(len(WORD.findall(s.casefold())) > MAX_WORDS for s in SENTENCE_BREAK.split(essay.text))
+    return {"samples": len(essays), "truncated_essays": affected,
+            "truncated_fraction": affected / len(essays), "discarded_tokens": lost,
+            "total_tokens": total, "discarded_fraction": lost / max(1, total),
+            "essays_with_long_sentence_chunking": chunked}
 
 
 def _sentences(text: str, max_sentences: int, max_words: int) -> list[list[str]]:
@@ -118,8 +143,14 @@ def _predict(model, loader, device, bounds) -> list[float]:
 
 
 def fit_han(train: list[Essay], validation: list[Essay], bounds, *, epochs, batch_size, seed):
+    if not train or not validation or epochs < 1 or batch_size < 1:
+        raise ValueError("Training needs nonempty data and positive epochs/batch size.")
+    random.seed(seed)
+    import numpy as np
+
+    np.random.seed(seed)
     torch.manual_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = training_device()
     train_sentences = [_sentences(essay.text, MAX_SENTENCES, MAX_WORDS) for essay in train]
     counts = Counter(word for essay in train_sentences for sentence in essay for word in sentence)
     vocabulary = {word: index for index, (word, _) in enumerate(counts.most_common(30_000), start=2)}
@@ -140,6 +171,7 @@ def fit_han(train: list[Essay], validation: list[Essay], bounds, *, epochs, batc
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
     best_mse = float("inf")
+    history = []
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -147,13 +179,21 @@ def fit_han(train: list[Essay], validation: list[Essay], bounds, *, epochs, batc
             optimizer.zero_grad()
             predictions = model(tokens.to(device))
             loss = loss_fn(predictions, targets.to(device))
+            if not torch.isfinite(loss):
+                raise ValueError(f"Nonfinite training loss at epoch {epoch}.")
             loss.backward()
+            if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+                raise ValueError(f"Nonfinite gradient at epoch {epoch}.")
             optimizer.step()
             total_loss += loss.item() * targets.numel()
 
         predicted = _predict(model, validation_loader, device, bounds)
         metrics = evaluate_scores(actual, predicted, bounds)
         validation_mse = metrics["mse"]
+        if not math.isfinite(validation_mse):
+            raise ValueError(f"Nonfinite validation MSE at epoch {epoch}.")
+        history.append({"epoch": epoch, "train_loss": total_loss / len(train),
+                        "validation_mse": validation_mse, "validation_qwk": metrics["qwk"]})
         print(
             f"Epoch {epoch}/{epochs} | train normalized MSE {total_loss / len(train):.4f} "
             f"| validation MSE {validation_mse:.4f} | validation QWK {metrics['qwk']}"
@@ -161,24 +201,42 @@ def fit_han(train: list[Essay], validation: list[Essay], bounds, *, epochs, batc
         if validation_mse < best_mse:
             best_mse = validation_mse
             best_metrics = metrics
-            best_weights = deepcopy(model.state_dict())
+            best_epoch = epoch
+            best_weights = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
     checkpoint = {
         "weights": best_weights,
         "vocabulary": vocabulary,
         "max_sentences": MAX_SENTENCES,
         "max_words": MAX_WORDS,
+        "model_config": {"embedding_size": 64, "hidden_size": 32},
+        "score_bounds": list(bounds),
+        "training": {"seed": seed, "epochs": epochs, "batch_size": batch_size,
+                     "optimizer": "AdamW", "learning_rate": 1e-3, "weight_decay": 0.01,
+                     "loss": "normalized MSE", "device": str(device),
+                     "torch_num_threads": torch.get_num_threads(),
+                     "parameter_count": sum(p.numel() for p in model.parameters()),
+                     "vocabulary_size": len(vocabulary), "dropout": 0.2,
+                     "best_epoch": best_epoch, "selection_metric": "minimum validation MSE",
+                     "history": history, "train_truncation": truncation_statistics(train)},
     }
     return checkpoint, best_metrics
 
 
 def predict_han(path: Path, texts: list[str], bounds) -> list[float]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    return predict_checkpoint(checkpoint, texts, bounds)
+
+
+def predict_checkpoint(checkpoint: dict, texts: list[str], bounds) -> list[float]:
+    device = training_device()
+    if "score_bounds" in checkpoint and list(bounds) != checkpoint["score_bounds"]:
+        raise ValueError("Score bounds differ from the checkpoint.")
     vocabulary = checkpoint["vocabulary"]
-    model = HANRegressor(len(vocabulary) + 2).to(device)
+    model = HANRegressor(len(vocabulary) + 2, **checkpoint.get("model_config", {})).to(device)
     model.load_state_dict(checkpoint["weights"])
+    batch_size = checkpoint.get("training", {}).get("batch_size", 16)
     loader = _prediction_loader(
-        texts, vocabulary, checkpoint["max_sentences"], checkpoint["max_words"], batch_size=16
+        texts, vocabulary, checkpoint["max_sentences"], checkpoint["max_words"], batch_size=batch_size
     )
     return _predict(model, loader, device, bounds)

@@ -6,16 +6,23 @@ import hashlib
 import json
 import pickle
 import statistics
+import math
+import platform
+import time
+from datetime import datetime, timezone
+from importlib.metadata import version
 from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from essay_scoring.artifacts import matches_text_sha256, text_sha256
 from essay_scoring.data import (
     DEFAULT_DATA_PATH,
     SCORE_RANGES,
     SPLIT_VERSION,
     create_manifest,
     load_asap,
+    load_training_split,
     manifest_path,
     read_manifest,
 )
@@ -33,7 +40,7 @@ def prepare(args: argparse.Namespace) -> None:
     if target.exists() and target.read_text(encoding="utf-8") != rendered:
         raise ValueError(f"Refusing to replace a different frozen manifest: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(rendered, encoding="utf-8")
+    target.write_text(rendered, encoding="utf-8", newline="\n")
 
     by_id = {essay.essay_id: essay for essay in essays}
     train_essays = [by_id[essay_id] for essay_id in manifest["splits"]["train"]]
@@ -70,9 +77,8 @@ def train(args: argparse.Namespace) -> None:
     if args.run_dir.exists():
         raise ValueError(f"Choose a new run directory. {args.run_dir} already exists.")
 
-    essays, fingerprint = load_asap(args.data, args.essay_set)
     manifest_file = _manifest_file(args, args.essay_set)
-    split = read_manifest(manifest_file, essays, fingerprint, args.essay_set)
+    split, fingerprint = load_training_split(args.data, manifest_file, args.essay_set)
     manifest_bytes = manifest_file.read_bytes()
     manifest = json.loads(manifest_bytes)
     if args.seed != manifest["seed"]:
@@ -80,17 +86,29 @@ def train(args: argparse.Namespace) -> None:
     bounds = SCORE_RANGES[args.essay_set]
     validation = split["validation"]
     settings = {}
+    started_at = datetime.now(timezone.utc).isoformat()
+    start = time.perf_counter()
     if args.model == "ridge":
         from essay_scoring.models.ridge import fit_ridge
 
         model = fit_ridge(split["train"])
+        training_seconds = time.perf_counter() - start
         predicted = model.predict([essay.text for essay in validation]).tolist()
         metrics = evaluate_scores([essay.score for essay in validation], predicted, bounds)
+        settings = {"ngram_range": [1, 2], "max_features": 30_000,
+                    "feature_count": len(model.named_steps["tfidfvectorizer"].vocabulary_),
+                    "ridge_parameters": model.named_steps["ridge"].get_params()}
     else:
         from essay_scoring.models.han import fit_han
 
         settings = {"epochs": args.epochs, "batch_size": args.batch_size}
         model, metrics = fit_han(split["train"], validation, bounds, seed=args.seed, **settings)
+        training_seconds = time.perf_counter() - start
+        settings = {**settings, **model["training"], **model["model_config"],
+                    "max_sentences": model["max_sentences"], "max_words": model["max_words"]}
+        from essay_scoring.models.han import predict_checkpoint
+
+        predicted = predict_checkpoint(model, [essay.text for essay in validation], bounds)
 
     run = {
         "essay_set": args.essay_set,
@@ -99,9 +117,15 @@ def train(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "split_version": SPLIT_VERSION,
         "dataset_sha256": fingerprint,
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "splits": {name: [essay.essay_id for essay in group] for name, group in split.items()},
+        "manifest_sha256": text_sha256(manifest_file),
+        "splits": manifest["splits"],
         "validation_metrics": metrics,
+        "started_at_utc": started_at,
+        "training_seconds": training_seconds,
+        "training_time_scope": "fit, including per-epoch validation for HAN; excludes serialization/reload",
+        "environment": {"python": platform.python_version(), "platform": platform.platform(),
+                        **{name: version(name) for name in ("numpy", "scikit-learn", "torch")}},
+        "test_content_and_labels_loaded": False,
     }
 
     args.run_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -114,10 +138,40 @@ def train(args: argparse.Namespace) -> None:
             import torch
 
             torch.save(model, staging / "model.pt")
-        (staging / "run.json").write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+            with (staging / "training_history.csv").open("w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(
+                    file, fieldnames=("epoch", "train_loss", "validation_mse", "validation_qwk"),
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(model["training"]["history"])
+        reloaded = _predict(staging, run, [essay.text for essay in validation])
+        before = clip_scores(predicted, bounds)
+        after = clip_scores(reloaded, bounds)
+        max_delta = max(abs(a - b) for a, b in zip(before, after, strict=True))
+        reloaded_metrics = evaluate_scores([essay.score for essay in validation], after, bounds)
+        if any(
+            not math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
+            for a, b in zip(before, after, strict=True)
+        ):
+            raise ValueError("Checkpoint reload changed validation predictions.")
+        metrics = reloaded_metrics
+        run["validation_metrics"] = metrics
+        run["checkpoint_verification"] = {
+            "validation_samples": len(after), "finite_and_in_range": True,
+            "max_absolute_reload_difference": max_delta, "reloaded_validation_metrics": reloaded_metrics,
+            "prediction_tolerance": {"relative": 1e-5, "absolute": 1e-6},
+            "examples": [{"essay_id": essay.essay_id, "before": a, "after": b}
+                         for essay, a, b in list(zip(validation, before, after, strict=True))[:5]],
+            "checkpoint_sha256": hashlib.sha256(_model_file(staging, run).read_bytes()).hexdigest(),
+        }
+        (staging / "run.json").write_text(
+            json.dumps(run, indent=2) + "\n", encoding="utf-8", newline="\n"
+        )
         staging.rename(args.run_dir)
 
-    print(json.dumps({"run_dir": str(args.run_dir), "validation_metrics": metrics}, indent=2))
+    print(json.dumps({"run_dir": str(args.run_dir), "validation_metrics": metrics,
+                      "training_seconds": training_seconds, "reload_max_difference": max_delta}, indent=2))
 
 
 def _read_run(run_dir: Path) -> dict:
@@ -138,14 +192,18 @@ def finalize(args: argparse.Namespace) -> None:
         "model": run["model"],
         "selection_note": args.note,
         "validation_metrics": run["validation_metrics"],
-        "run_sha256": hashlib.sha256((args.run_dir / "run.json").read_bytes()).hexdigest(),
+        "run_sha256": text_sha256(args.run_dir / "run.json"),
         "model_sha256": hashlib.sha256(_model_file(args.run_dir, run).read_bytes()).hexdigest(),
     }
     path = args.run_dir.parent / "final-selection.json"
     rendered = json.dumps(selection, indent=2, ensure_ascii=False) + "\n"
-    if path.exists() and path.read_text(encoding="utf-8") != rendered:
-        raise ValueError(f"A different final model is already recorded at {path}.")
-    path.write_text(rendered, encoding="utf-8")
+    if path.exists():
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if matches_text_sha256(args.run_dir / "run.json", previous.get("run_sha256")):
+            previous["run_sha256"] = selection["run_sha256"]
+        if previous != selection:
+            raise ValueError(f"A different final model is already recorded at {path}.")
+    path.write_text(rendered, encoding="utf-8", newline="\n")
     print(json.dumps({"selection_file": str(path), "essay_set": run["essay_set"], "model": run["model"]}, indent=2))
 
 
@@ -165,7 +223,7 @@ def evaluate(args: argparse.Namespace) -> None:
     run = _read_run(args.run_dir)
     selection_path = args.run_dir.parent / "final-selection.json"
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
-    if (selection.get("run_sha256") != hashlib.sha256((args.run_dir / "run.json").read_bytes()).hexdigest()
+    if (not matches_text_sha256(args.run_dir / "run.json", selection.get("run_sha256"))
             or selection.get("model_sha256") != hashlib.sha256(_model_file(args.run_dir, run).read_bytes()).hexdigest()):
         raise ValueError("The selected run or checkpoint changed after finalization.")
     essay_set = run["essay_set"]
@@ -173,7 +231,7 @@ def evaluate(args: argparse.Namespace) -> None:
     if fingerprint != run["dataset_sha256"]:
         raise ValueError("Use the same ASAP TSV file used for training.")
     manifest_file = _manifest_file(args, essay_set)
-    if hashlib.sha256(manifest_file.read_bytes()).hexdigest() != run["manifest_sha256"]:
+    if not matches_text_sha256(manifest_file, run["manifest_sha256"]):
         raise ValueError("Use the exact split manifest saved with the trained run.")
     split = read_manifest(manifest_file, essays, fingerprint, essay_set)
     if {name: [essay.essay_id for essay in group] for name, group in split.items()} != run["splits"]:
